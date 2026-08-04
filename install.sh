@@ -3,8 +3,7 @@
 # marznode-setup — All-in-one installer & Xray core manager for Marzneshin nodes
 # https://github.com/Cmd81/up-marznode-xray
 #
-# Steps: update server -> dns -> docker -> marznode -> configure -> xray core
-#        extras: Let's Encrypt certificates, Cloudflare WARP (wgcf)
+# Steps: update server -> install docker -> install marznode -> configure -> set xray core
 #
 # Quick start (interactive menu):
 #   bash <(curl -sL https://raw.githubusercontent.com/Cmd81/up-marznode-xray/main/install.sh)
@@ -52,6 +51,7 @@ CERTS_BASE=""
 LE_EMAIL=""
 DOMAIN_LIST=""
 DNS_SERVERS="$DEFAULT_DNS"
+WIZARD=0
 
 # ---------------------------------------------------------------- ui helpers
 if [ -t 1 ]; then
@@ -660,6 +660,170 @@ warp_enable() {
   warp_status
 }
 
+# ================================================================ WIZARD MODE
+# Ask every question up front, then run the seven steps back-to-back with no
+# further prompts, then print one final report.
+run_wizard() {
+  banner
+  echo "${C_BLD}Guided setup — answer a few questions, then everything runs automatically.${C_OFF}"
+  echo
+
+  # -------- 1/7 collect answers (nothing is executed yet) --------
+  local do_upgrade wiz_port wiz_core wiz_warp wiz_ncerts
+  local -a wiz_domains=()
+  local wiz_email="" wiz_cert_src=""
+
+  confirm "Run a full 'apt upgrade' too (can restart services)?" && do_upgrade=1 || do_upgrade=0
+
+  ensure_tty && {
+    if [ ! -s "$CERT_FILE" ] || ! grep -q "BEGIN CERTIFICATE" "$CERT_FILE" 2>/dev/null; then
+      wiz_cert_src="$(ask "Path to the node's client.pem (empty = paste it later)" "")"
+    fi
+  }
+
+  wiz_port="$(ask "SERVICE_PORT for this node" "$DEFAULT_PORT")"
+  wiz_core="$(ask "Xray core version to install" "25.8.3")"
+
+  confirm "Install Cloudflare WARP (wgcf) on this server?" && wiz_warp=1 || wiz_warp=0
+
+  wiz_ncerts="$(ask "How many domains do you want a Let's Encrypt certificate for? (0 = skip)" "0")"
+  [[ "$wiz_ncerts" =~ ^[0-9]+$ ]] || die "invalid number: $wiz_ncerts"
+  if [ "$wiz_ncerts" -gt 0 ]; then
+    local i d
+    for ((i = 1; i <= wiz_ncerts; i++)); do
+      d="$(ask "  domain #$i")"
+      [ -n "$d" ] || die "empty domain"
+      wiz_domains+=("$d")
+    done
+    wiz_email="$(ask "Email for Let's Encrypt (empty = register without one)" "")"
+  fi
+
+  echo
+  info "All questions answered — running unattended from here on."
+  echo
+
+  # apply the collected answers to the globals the step_* functions read
+  ASSUME_YES=1
+  [ "$do_upgrade" -eq 1 ] && FULL_UPGRADE=1
+  [ -n "$wiz_cert_src" ] && CERT_SRC_FILE="$wiz_cert_src"
+  WANT_PORT="$wiz_port"
+  CORE_VERSION="$wiz_core"
+  LE_EMAIL="$wiz_email"
+  if [ "$wiz_ncerts" -gt 0 ]; then
+    DOMAIN_LIST="$(IFS=,; echo "${wiz_domains[*]}")"
+  fi
+
+  local t0 rc=0
+  t0="$(date +%s)"
+
+  # -------- 2/7 update & upgrade --------
+  echo "${C_BLD}[1/7] Updating the server${C_OFF}"
+  step_update_server || rc=1
+
+  # -------- 3/7 install marznode --------
+  echo; echo "${C_BLD}[2/7] Installing marznode${C_OFF}"
+  step_install_docker || rc=1
+  step_install_marznode || rc=1
+
+  # -------- 4/7 config (port + cert already applied inside step 3) ---------
+  echo; echo "${C_BLD}[3/7] Node configuration (port, certificate)${C_OFF}"
+  ok "SERVICE_PORT=$wiz_port and client.pem were applied during install"
+
+  # -------- 5/7 xray core --------
+  echo; echo "${C_BLD}[4/7] Updating the Xray core to v${wiz_core}${C_OFF}"
+  step_change_core || rc=1
+
+  # -------- 6/7 warp --------
+  if [ "$wiz_warp" -eq 1 ]; then
+    echo; echo "${C_BLD}[5/7] Installing Cloudflare WARP${C_OFF}"
+    step_install_warp || rc=1
+  else
+    echo; echo "${C_BLD}[5/7] Cloudflare WARP — skipped${C_OFF}"
+  fi
+
+  # -------- 7/7 certificates --------
+  if [ "$wiz_ncerts" -gt 0 ]; then
+    echo; echo "${C_BLD}[6/7] Issuing TLS certificates${C_OFF}"
+    step_get_certs || rc=1
+  else
+    echo; echo "${C_BLD}[6/7] TLS certificates — skipped${C_OFF}"
+  fi
+
+  # -------- final report --------
+  echo; echo "${C_BLD}[7/7] Final report${C_OFF}"
+  wizard_report "$t0" "$wiz_port" "$wiz_core" "$wiz_warp" "$wiz_ncerts"
+
+  return "$rc"
+}
+
+wizard_report() {
+  local t0="$1" port="$2" core="$3" warp="$4" ncerts="$5"
+  local dur; dur=$(( $(date +%s) - t0 ))
+  local dir; dir="$(detect_app_dir)"
+  local base; base="$(resolve_certs_base)"
+
+  echo
+  echo "══════════════════════════════════════════════════════════"
+  echo "  ${C_BLD}marznode-setup — final report${C_OFF}  (${dur}s)"
+  echo "══════════════════════════════════════════════════════════"
+
+  printf '  %-20s ' "Server"
+  if [ "${FULL_UPGRADE:-0}" -eq 1 ]; then echo "updated + upgraded"; else echo "updated (no full upgrade)"; fi
+
+  printf '  %-20s %s\n' "Install dir" "$dir"
+
+  printf '  %-20s ' "marznode container"
+  if compose ps --status running 2>/dev/null | grep -q marznode; then
+    echo "${C_GRN}running${C_OFF} on port $port"
+  else
+    echo "${C_RED}not running${C_OFF} — check: cd $dir && docker compose logs -f"
+  fi
+
+  printf '  %-20s ' "Xray core"
+  if [ -x "$XRAY_BIN" ]; then
+    echo "$("$XRAY_BIN" version 2>/dev/null | head -n1)  (requested v$core)"
+  else
+    echo "${C_YEL}not installed — image default in use (requested v$core)${C_OFF}"
+  fi
+
+  printf '  %-20s ' "Cloudflare WARP"
+  if [ "$warp" -eq 1 ]; then
+    if systemctl is-active --quiet wg-quick@warp 2>/dev/null; then
+      echo "${C_GRN}active${C_OFF} (Table=off — not the default route)"
+    else
+      echo "${C_RED}requested but not active${C_OFF} — check: journalctl -u wg-quick@warp"
+    fi
+  else
+    echo "skipped"
+  fi
+
+  printf '  %-20s ' "TLS certificates"
+  if [ "$ncerts" -gt 0 ] && [ -d "$base" ]; then
+    echo "$base"
+    local d
+    for d in "$base"/*/; do
+      [ -d "$d" ] || continue
+      printf '    - %-30s' "$(basename "$d")"
+      if [ -f "$d/fullchain.pem" ] && command -v openssl >/dev/null 2>&1; then
+        printf 'expires %s' "$(openssl x509 -enddate -noout -in "$d/fullchain.pem" 2>/dev/null | cut -d= -f2)"
+      else
+        printf '${C_RED}missing${C_OFF}'
+      fi
+      echo
+    done
+  else
+    echo "skipped"
+  fi
+
+  echo "──────────────────────────────────────────────────────────"
+  echo "  useful commands:"
+  echo "    marznode-setup --status"
+  echo "    cd $dir && docker compose logs -f"
+  [ "$warp" -eq 1 ] && echo "    marznode-setup --warp-status"
+  echo "══════════════════════════════════════════════════════════"
+  echo
+}
+
 # ------------------------------------------------------------------ utilities
 show_status() {
   local dir; dir="$(detect_app_dir)"
@@ -746,8 +910,9 @@ BANNER
 menu() {
   banner
   cat <<'MENU'
-  --- install ---------------------------------------------------
-  1) Full install     (update -> dns -> docker -> node -> core)
+  --- guided ------------------------------------------------------
+  1) Guided full setup  (asks everything first, then runs it all)
+  --- install (manual, step by step) -------------------------------
   2) Update server packages
   3) Set DNS resolvers (1.1.1.1 / 8.8.8.8)
   4) Install docker
@@ -769,15 +934,7 @@ menu() {
 MENU
   local choice; choice="$(ask "select" "1")"
   case "$choice" in
-    1) step_update_server
-       confirm "Set DNS resolvers to $DEFAULT_DNS?" && step_setup_dns "$DEFAULT_DNS"
-       step_install_docker; step_install_marznode
-       if confirm "Replace the built-in xray core with a specific version?"; then
-         CORE_VERSION="$(ask "version (or 'latest')" "latest")"; step_change_core
-       fi
-       confirm "Get TLS certificates for one or more domains now?" && step_get_certs
-       confirm "Install Cloudflare WARP now?" && step_install_warp
-       ;;
+    1) run_wizard ;;
     2) step_update_server ;;
     3) step_setup_dns "$(ask "resolvers" "$DEFAULT_DNS")" ;;
     4) step_install_docker ;;
@@ -810,6 +967,9 @@ marznode-setup v${SCRIPT_VERSION}
 Usage: install.sh [options]
   (no options)          interactive menu
 
+  --wizard              guided mode: ask everything up front, then run
+                        update -> marznode -> config -> xray core -> warp ->
+                        certificates -> final report, with no further prompts
   --all                 run every step: update, dns, docker, node, core
   --update              update system packages
   --full-upgrade        with --update, also run apt upgrade
@@ -851,6 +1011,7 @@ main() {
   local ran=0
   while [ $# -gt 0 ]; do
     case "$1" in
+      --wizard)       WIZARD=1 ;;
       --all)          DO_UPDATE=1; DO_DNS=1; DO_DOCKER=1; DO_NODE=1; DO_CORE=1 ;;
       --update)       DO_UPDATE=1 ;;
       --full-upgrade) DO_UPDATE=1; FULL_UPGRADE=1 ;;
@@ -883,6 +1044,11 @@ main() {
     esac
     shift
   done
+
+  if [ "$WIZARD" -eq 1 ]; then
+    run_wizard
+    exit $?
+  fi
 
   if [ $((DO_UPDATE + DO_DNS + DO_DOCKER + DO_NODE + DO_CORE + DO_CERTS + DO_WARP)) -eq 0 ]; then
     [ "$ran" -eq 1 ] && exit 0
