@@ -3,7 +3,8 @@
 # marznode-setup — All-in-one installer & Xray core manager for Marzneshin nodes
 # https://github.com/Cmd81/up-marznode-xray
 #
-# Steps: update server -> install docker -> install marznode -> configure -> set xray core
+# Steps: update server -> dns -> docker -> marznode -> configure -> xray core
+#        extras: Let's Encrypt certificates, Cloudflare WARP (wgcf)
 #
 # Quick start (interactive menu):
 #   bash <(curl -sL https://raw.githubusercontent.com/Cmd81/up-marznode-xray/main/install.sh)
@@ -13,10 +14,11 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 REPO_RAW="https://raw.githubusercontent.com/Cmd81/up-marznode-xray/main"
 
 MARZNODE_DIR="/var/lib/marznode"
+MARZNESHIN_DIR="/var/lib/marzneshin"
 ASSETS_DIR="${MARZNODE_DIR}/data"
 CERT_FILE="${MARZNODE_DIR}/client.pem"
 XRAY_CONFIG="${MARZNODE_DIR}/xray_config.json"
@@ -25,7 +27,11 @@ XRAY_BIN="${MARZNODE_DIR}/xray"
 APP_DIR_DEFAULT="/opt/marznode"
 MARZNODE_GIT="https://github.com/marzneshin/marznode"
 XRAY_REPO="XTLS/Xray-core"
+WGCF_REPO="ViRb3/wgcf"
 DEFAULT_PORT="53042"
+DEFAULT_DNS="1.1.1.1 8.8.8.8"
+WARP_MTU="1420"
+WGCF_DIR="/etc/wireguard/wgcf"
 
 # runtime flags
 ASSUME_YES=0
@@ -33,12 +39,19 @@ DO_UPDATE=0
 DO_DOCKER=0
 DO_NODE=0
 DO_CORE=0
+DO_DNS=0
+DO_CERTS=0
+DO_WARP=0
 CORE_VERSION=""
 WANT_PORT=""
 CERT_SRC_FILE=""
 CERT_SRC_URL=""
 FULL_UPGRADE=0
 APP_DIR=""
+CERTS_BASE=""
+LE_EMAIL=""
+DOMAIN_LIST=""
+DNS_SERVERS="$DEFAULT_DNS"
 
 # ---------------------------------------------------------------- ui helpers
 if [ -t 1 ]; then
@@ -270,6 +283,10 @@ step_install_marznode() {
   fi
   set_service_port "$port"
 
+  # keep xray supervised: restart it inside the container if it dies
+  set_env "XRAY_RESTART_ON_FAILURE"          "True" "$dir/compose.yml"
+  set_env "XRAY_RESTART_ON_FAILURE_INTERVAL" "5"    "$dir/compose.yml"
+
   info "pulling image and starting the container"
   ( cd "$dir" && docker compose pull -q && docker compose up -d )
   sleep 5
@@ -355,6 +372,294 @@ step_change_core() {
   fi
 }
 
+# ================================================================= STEP: DNS
+step_setup_dns() {
+  local dns="${1:-$DEFAULT_DNS}"
+  info "configuring resolvers: $dns"
+  if [ -f /etc/systemd/resolved.conf ] && systemctl list-unit-files 2>/dev/null | grep -q systemd-resolved; then
+    cp -f /etc/systemd/resolved.conf "/etc/systemd/resolved.conf.bak.$(date +%Y%m%d-%H%M%S)"
+    if grep -qE '^[#[:space:]]*DNS=' /etc/systemd/resolved.conf; then
+      sed -i -E "s|^[#[:space:]]*DNS=.*|DNS=${dns}|" /etc/systemd/resolved.conf
+    else
+      printf 'DNS=%s\n' "$dns" >>/etc/systemd/resolved.conf
+    fi
+    systemctl restart systemd-resolved
+    ok "systemd-resolved updated"
+  else
+    warn "systemd-resolved not present — writing /etc/resolv.conf directly"
+    cp -f /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    : >/etc/resolv.conf
+    local s; for s in $dns; do printf 'nameserver %s\n' "$s" >>/etc/resolv.conf; done
+    ok "/etc/resolv.conf updated"
+  fi
+  getent hosts github.com >/dev/null 2>&1 \
+    && ok "name resolution works" \
+    || warn "name resolution test failed — check the settings"
+}
+
+# =============================================================== STEP: certbot
+# Decide where issued certificates are copied to.
+resolve_certs_base() {
+  if [ -n "$CERTS_BASE" ]; then echo "$CERTS_BASE"; return; fi
+  if [ -d "$MARZNESHIN_DIR" ]; then echo "${MARZNESHIN_DIR}/certs"; return; fi
+  echo "${MARZNODE_DIR}/certs"
+}
+
+server_ip() {
+  curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null \
+    || ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}'
+}
+
+# Warn (do not block) when the domain does not point at this server.
+check_domain_dns() {
+  local domain="$1" mine resolved
+  mine="$(server_ip)"; resolved="$(getent hosts "$domain" | awk '{print $1; exit}')"
+  if [ -z "$resolved" ]; then
+    warn "$domain does not resolve yet — certbot will fail"
+    return 1
+  fi
+  if [ -n "$mine" ] && [ "$resolved" != "$mine" ]; then
+    warn "$domain -> $resolved but this server is $mine (Cloudflare proxy? disable the orange cloud)"
+    return 1
+  fi
+  ok "$domain -> $resolved"
+  return 0
+}
+
+port80_holder() {
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -lntpH 2>/dev/null | awk '$4 ~ /:80$/ {print $6; exit}'
+}
+
+copy_domain_cert() {
+  local domain="$1" base="$2" live="/etc/letsencrypt/live/$1" dest
+  [ -d "$live" ] || { warn "no live directory for $domain"; return 1; }
+  dest="$base/$domain"
+  install -d -m 755 "$dest"
+  cp -fL "$live/fullchain.pem" "$dest/fullchain.pem"
+  cp -fL "$live/privkey.pem"   "$dest/privkey.pem"
+  chmod 644 "$dest/fullchain.pem"; chmod 600 "$dest/privkey.pem"
+  ok "copied -> $dest/{fullchain,privkey}.pem"
+}
+
+# Certbot only renews; it does not copy. Without this hook the copies under
+# /var/lib/... silently go stale after 90 days.
+install_renew_hook() {
+  local base="$1" dir; dir="$(detect_app_dir)"
+  install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
+  cat >/etc/letsencrypt/renewal-hooks/deploy/marznode-certs.sh <<HOOK
+#!/usr/bin/env bash
+# generated by marznode-setup — re-copies renewed certificates and reloads the node
+set -euo pipefail
+BASE="$base"
+APP_DIR="$dir"
+for live in /etc/letsencrypt/live/*/; do
+  d="\$(basename "\$live")"
+  [ "\$d" = "README" ] && continue
+  install -d -m 755 "\$BASE/\$d"
+  cp -fL "\$live/fullchain.pem" "\$BASE/\$d/fullchain.pem"
+  cp -fL "\$live/privkey.pem"   "\$BASE/\$d/privkey.pem"
+  chmod 644 "\$BASE/\$d/fullchain.pem"; chmod 600 "\$BASE/\$d/privkey.pem"
+done
+if [ -f "\$APP_DIR/compose.yml" ]; then
+  cd "\$APP_DIR" && docker compose restart || true
+fi
+HOOK
+  chmod +x /etc/letsencrypt/renewal-hooks/deploy/marznode-certs.sh
+  ok "renewal hook installed (/etc/letsencrypt/renewal-hooks/deploy/marznode-certs.sh)"
+}
+
+issue_cert() {
+  local domain="$1" base="$2" stopped=0 holder
+  info "issuing a certificate for $domain"
+  check_domain_dns "$domain" || confirm "DNS looks wrong. Continue anyway?" || return 1
+
+  holder="$(port80_holder)"
+  if [ -n "$holder" ]; then
+    warn "port 80 is busy ($holder) — certbot --standalone needs it"
+    if confirm "Temporarily stop the marznode container to free port 80?"; then
+      compose down >/dev/null 2>&1 && stopped=1
+    else
+      warn "skipping $domain"; return 1
+    fi
+  fi
+
+  local args=(certonly --standalone -d "$domain" --agree-tos --no-eff-email
+              --non-interactive --keep-until-expiring)
+  if [ -n "$LE_EMAIL" ]; then
+    args+=(--email "$LE_EMAIL")
+  else
+    args+=(--register-unsafely-without-email)
+  fi
+
+  if certbot "${args[@]}"; then
+    copy_domain_cert "$domain" "$base"
+  else
+    err "certbot failed for $domain"
+    [ "$stopped" -eq 1 ] && compose up -d >/dev/null 2>&1
+    return 1
+  fi
+  [ "$stopped" -eq 1 ] && compose up -d >/dev/null 2>&1
+  return 0
+}
+
+step_get_certs() {
+  need_apt; apt_env
+  info "step — TLS certificates (Let's Encrypt)"
+  command -v certbot >/dev/null 2>&1 || { info "installing certbot"; apt-get install -y -qq certbot; }
+
+  local base; base="$(resolve_certs_base)"
+  install -d -m 755 "$base"
+  info "certificates will be placed in: $base"
+
+  local -a domains=()
+  if [ -n "$DOMAIN_LIST" ]; then
+    IFS=',' read -r -a domains <<<"$DOMAIN_LIST"
+  else
+    local count i d
+    count="$(ask "How many domains do you want a certificate for?" "1")"
+    [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -ge 1 ] || die "invalid count: $count"
+    for ((i = 1; i <= count; i++)); do
+      d="$(ask "domain #$i")"
+      [ -n "$d" ] || die "empty domain"
+      domains+=("$d")
+    done
+  fi
+  [ -n "$LE_EMAIL" ] || LE_EMAIL="$(ask "email for Let's Encrypt (empty = none)" "")"
+
+  local d failed=0 first=""
+  for d in "${domains[@]}"; do
+    d="$(echo "$d" | tr -d '[:space:]')"
+    [ -n "$d" ] || continue
+    if issue_cert "$d" "$base"; then
+      [ -z "$first" ] && first="$d"
+    else
+      failed=$((failed + 1))
+    fi
+  done
+
+  # convenience: flat copy of the primary domain at the base of the directory,
+  # matching the layout used by older manual setups
+  if [ -n "$first" ]; then
+    cp -fL "$base/$first/fullchain.pem" "$base/fullchain.pem"
+    cp -fL "$base/$first/privkey.pem"   "$base/privkey.pem"
+    chmod 600 "$base/privkey.pem"
+    info "primary domain $first also copied flat to $base/{fullchain,privkey}.pem"
+  fi
+
+  install_renew_hook "$base"
+  [ "$failed" -eq 0 ] && ok "all certificates ready" || warn "$failed domain(s) failed"
+
+  echo
+  info "paths to use in the panel / xray config:"
+  for d in "${domains[@]}"; do
+    d="$(echo "$d" | tr -d '[:space:]')"
+    [ -d "$base/$d" ] && printf '  %s -> %s/{fullchain,privkey}.pem\n' "$d" "$base/$d"
+  done
+  echo
+}
+
+# ================================================================== STEP: WARP
+wgcf_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)  echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7)  echo "armv7" ;;
+    armv6l)        echo "armv6" ;;
+    i386|i686)     echo "386" ;;
+    s390x)         echo "s390x" ;;
+    *) die "wgcf: unsupported architecture $(uname -m)" ;;
+  esac
+}
+
+latest_wgcf_version() {
+  local json ver url
+  if json="$(curl -fsSL "https://api.github.com/repos/${WGCF_REPO}/releases/latest" 2>/dev/null)"; then
+    ver="$(printf '%s\n' "$json" | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')"
+    [ -n "$ver" ] && { printf '%s' "$ver"; return 0; }
+  fi
+  url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+        "https://github.com/${WGCF_REPO}/releases/latest" 2>/dev/null)" || return 1
+  ver="${url##*/tag/}"; ver="${ver#v}"
+  [ -n "$ver" ] && [ "$ver" != "$url" ] || return 1
+  printf '%s' "$ver"
+}
+
+step_install_warp() {
+  need_apt; apt_env
+  info "step — Cloudflare WARP (wgcf + wireguard)"
+  apt-get install -y -qq wireguard wireguard-tools resolvconf >/dev/null \
+    || die "could not install wireguard packages"
+
+  if ! command -v wgcf >/dev/null 2>&1; then
+    local ver arch
+    ver="$(latest_wgcf_version)" || die "could not resolve the latest wgcf release"
+    arch="$(wgcf_arch)"
+    info "installing wgcf v$ver ($arch)"
+    curl -fL --retry 3 --progress-bar \
+      -o /usr/bin/wgcf \
+      "https://github.com/${WGCF_REPO}/releases/download/v${ver}/wgcf_${ver}_linux_${arch}" \
+      || die "wgcf download failed"
+    chmod +x /usr/bin/wgcf
+  fi
+  ok "wgcf: $(command -v wgcf)"
+
+  install -d -m 700 "$WGCF_DIR"
+  cd "$WGCF_DIR"
+  if [ ! -f "$WGCF_DIR/wgcf-account.toml" ]; then
+    info "registering a new WARP account"
+    wgcf register --accept-tos || die "wgcf register failed"
+  else
+    info "existing WARP account found — updating"
+    wgcf update || warn "wgcf update failed; continuing with the current account"
+  fi
+  wgcf generate || die "wgcf generate failed"
+  [ -f "$WGCF_DIR/wgcf-profile.conf" ] || die "wgcf-profile.conf was not produced"
+
+  # MTU 1420 avoids fragmentation; Table=off keeps WARP from hijacking the
+  # server's default route (otherwise the node loses its own connectivity).
+  local prof="$WGCF_DIR/wgcf-profile.conf"
+  grep -qE '^[[:space:]]*MTU[[:space:]]*=' "$prof" \
+    && sed -i -E "s|^[[:space:]]*MTU[[:space:]]*=.*|MTU = ${WARP_MTU}|" "$prof" \
+    || sed -i "0,/^\[Interface\]/s||&\nMTU = ${WARP_MTU}|" "$prof"
+  grep -qE '^[[:space:]]*Table[[:space:]]*=' "$prof" \
+    && sed -i -E "s|^[[:space:]]*Table[[:space:]]*=.*|Table = off|" "$prof" \
+    || sed -i "0,/^\[Interface\]/s||&\nTable = off|" "$prof"
+
+  install -m 600 "$prof" /etc/wireguard/warp.conf
+  ok "/etc/wireguard/warp.conf written (MTU ${WARP_MTU}, Table off)"
+
+  systemctl enable --now wg-quick@warp >/dev/null 2>&1 \
+    || die "wg-quick@warp failed to start — check: journalctl -u wg-quick@warp"
+  sleep 2
+  warp_status
+  warn "Table=off means WARP is NOT the default route. Traffic only uses it when"
+  warn "an xray outbound is bound to the warp interface / its address."
+}
+
+warp_status() {
+  if systemctl is-active --quiet wg-quick@warp 2>/dev/null; then
+    ok "wg-quick@warp is active"
+    wg show warp 2>/dev/null | head -n 8 || true
+    local trace
+    trace="$(curl -fsSL --max-time 8 --interface warp https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^warp=' || true)"
+    [ -n "$trace" ] && info "cloudflare trace via warp: $trace"
+  else
+    info "wg-quick@warp is not running"
+  fi
+}
+
+warp_disable() {
+  systemctl disable --now wg-quick@warp >/dev/null 2>&1 || true
+  ok "warp disabled"
+}
+
+warp_enable() {
+  [ -f /etc/wireguard/warp.conf ] || die "warp.conf not found — run the WARP install first"
+  systemctl enable --now wg-quick@warp
+  warp_status
+}
+
 # ------------------------------------------------------------------ utilities
 show_status() {
   local dir; dir="$(detect_app_dir)"
@@ -372,6 +677,27 @@ show_status() {
     ( cd "$dir" && docker compose ps ) 2>/dev/null || true
   else
     warn "no compose.yml found — node not installed"
+  fi
+  local base; base="$(resolve_certs_base)"
+  if [ -d "$base" ]; then
+    echo
+    info "certificates in $base:"
+    local d
+    for d in "$base"/*/; do
+      [ -d "$d" ] || continue
+      printf '  %s' "$(basename "$d")"
+      if [ -f "$d/fullchain.pem" ] && command -v openssl >/dev/null 2>&1; then
+        printf '  (expires %s)' \
+          "$(openssl x509 -enddate -noout -in "$d/fullchain.pem" 2>/dev/null | cut -d= -f2)"
+      fi
+      echo
+    done
+  fi
+  echo
+  if systemctl is-active --quiet wg-quick@warp 2>/dev/null; then
+    ok "warp: active"
+  else
+    info "warp: inactive"
   fi
   echo
 }
@@ -420,37 +746,58 @@ BANNER
 menu() {
   banner
   cat <<'MENU'
-  1) Full install       (update -> docker -> marznode -> xray core)
-  2) Update server packages only
-  3) Install docker only
-  4) Install / repair marznode only
-  5) Change or update the xray core
-  6) Change SERVICE_PORT
-  7) Status
-  8) Logs
-  9) Restart node
- 10) Update marznode (git pull + image pull)
- 11) Install the "marznode-setup" shortcut
- 12) Uninstall
+  --- install ---------------------------------------------------
+  1) Full install     (update -> dns -> docker -> node -> core)
+  2) Update server packages
+  3) Set DNS resolvers (1.1.1.1 / 8.8.8.8)
+  4) Install docker
+  5) Install / repair marznode
+  6) Change or update the xray core
+  --- extras ----------------------------------------------------
+  7) Get TLS certificates (Let's Encrypt / certbot)
+  8) Install Cloudflare WARP (wgcf)
+  9) WARP: enable / disable / status
+  --- manage ----------------------------------------------------
+ 10) Change SERVICE_PORT
+ 11) Status
+ 12) Logs
+ 13) Restart node
+ 14) Update marznode (git pull + image pull)
+ 15) Install the "marznode-setup" shortcut
+ 16) Uninstall node
   0) Exit
 MENU
   local choice; choice="$(ask "select" "1")"
   case "$choice" in
-    1) step_update_server; step_install_docker; step_install_marznode
+    1) step_update_server
+       confirm "Set DNS resolvers to $DEFAULT_DNS?" && step_setup_dns "$DEFAULT_DNS"
+       step_install_docker; step_install_marznode
        if confirm "Replace the built-in xray core with a specific version?"; then
          CORE_VERSION="$(ask "version (or 'latest')" "latest")"; step_change_core
-       fi ;;
+       fi
+       confirm "Get TLS certificates for one or more domains now?" && step_get_certs
+       confirm "Install Cloudflare WARP now?" && step_install_warp
+       ;;
     2) step_update_server ;;
-    3) step_install_docker ;;
-    4) step_install_marznode ;;
-    5) CORE_VERSION="$(ask "version (or 'latest')" "latest")"; step_change_core ;;
-    6) set_service_port "$(ask "port" "$DEFAULT_PORT")"; restart_node ;;
-    7) show_status ;;
-    8) show_logs ;;
-    9) restart_node ;;
-   10) update_node ;;
-   11) install_shortcut ;;
-   12) uninstall_node ;;
+    3) step_setup_dns "$(ask "resolvers" "$DEFAULT_DNS")" ;;
+    4) step_install_docker ;;
+    5) step_install_marznode ;;
+    6) CORE_VERSION="$(ask "version (or 'latest')" "latest")"; step_change_core ;;
+    7) step_get_certs ;;
+    8) step_install_warp ;;
+    9) local w; w="$(ask "warp action (enable/disable/status)" "status")"
+       case "$w" in
+         enable)  warp_enable ;;
+         disable) warp_disable ;;
+         *)       warp_status ;;
+       esac ;;
+   10) set_service_port "$(ask "port" "$DEFAULT_PORT")"; restart_node ;;
+   11) show_status ;;
+   12) show_logs ;;
+   13) restart_node ;;
+   14) update_node ;;
+   15) install_shortcut ;;
+   16) uninstall_node ;;
     0) exit 0 ;;
     *) die "invalid choice" ;;
   esac
@@ -463,23 +810,38 @@ marznode-setup v${SCRIPT_VERSION}
 Usage: install.sh [options]
   (no options)          interactive menu
 
-  --all                 run every step: update, docker, node, core
+  --all                 run every step: update, dns, docker, node, core
   --update              update system packages
   --full-upgrade        with --update, also run apt upgrade
+  --dns [RESOLVERS]     set resolvers (default "${DEFAULT_DNS}")
   --docker              install docker + compose plugin
   --node                install / repair marznode
   --core [VERSION]      install an xray core (default: latest)
   --port PORT           SERVICE_PORT (default ${DEFAULT_PORT})
   --dir PATH            marznode project dir (default ${APP_DIR_DEFAULT})
-  --cert-file PATH      read client.pem from a local file
+  --cert-file PATH      read client.pem (node <-> panel) from a local file
   --cert-url URL        download client.pem from a URL
+
+ TLS / domains:
+  --certs [d1,d2,...]   issue Let's Encrypt certs (asks interactively if empty)
+  --email ADDR          email used for Let's Encrypt registration
+  --certs-dir PATH      where issued certs are copied
+                        (default: ${MARZNESHIN_DIR}/certs if the panel is
+                         installed, otherwise ${MARZNODE_DIR}/certs)
+
+ WARP:
+  --warp                install Cloudflare WARP via wgcf (Table=off)
+  --warp-on | --warp-off | --warp-status
+
+ Manage:
   --status | --logs | --restart | --update-node | --uninstall
   -y, --yes             assume yes for all prompts
   -h, --help            this help
 
 Examples:
   install.sh --all --cert-file /root/client.pem --port 53042 -y
-  install.sh --core 25.8.3
+  install.sh --certs node1.example.com,node2.example.com --email you@mail.com -y
+  install.sh --warp
   install.sh --core latest
 USAGE
 }
@@ -489,13 +851,23 @@ main() {
   local ran=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --all)          DO_UPDATE=1; DO_DOCKER=1; DO_NODE=1; DO_CORE=1 ;;
+      --all)          DO_UPDATE=1; DO_DNS=1; DO_DOCKER=1; DO_NODE=1; DO_CORE=1 ;;
       --update)       DO_UPDATE=1 ;;
       --full-upgrade) DO_UPDATE=1; FULL_UPGRADE=1 ;;
+      --dns)          DO_DNS=1
+                      if [ "${2:-}" ] && [[ "${2}" != -* ]]; then DNS_SERVERS="$2"; shift; fi ;;
       --docker)       DO_DOCKER=1 ;;
       --node)         DO_NODE=1 ;;
       --core)         DO_CORE=1
                       if [ "${2:-}" ] && [[ "${2}" != -* ]]; then CORE_VERSION="$2"; shift; fi ;;
+      --certs)        DO_CERTS=1
+                      if [ "${2:-}" ] && [[ "${2}" != -* ]]; then DOMAIN_LIST="$2"; shift; fi ;;
+      --email)        LE_EMAIL="${2:?--email needs a value}"; shift ;;
+      --certs-dir)    CERTS_BASE="${2:?--certs-dir needs a path}"; shift ;;
+      --warp)         DO_WARP=1 ;;
+      --warp-on)      warp_enable; ran=1 ;;
+      --warp-off)     warp_disable; ran=1 ;;
+      --warp-status)  warp_status; ran=1 ;;
       --port)         WANT_PORT="${2:?--port needs a value}"; shift ;;
       --dir)          APP_DIR="${2:?--dir needs a value}"; shift ;;
       --cert-file)    CERT_SRC_FILE="${2:?--cert-file needs a path}"; shift ;;
@@ -512,7 +884,7 @@ main() {
     shift
   done
 
-  if [ $((DO_UPDATE + DO_DOCKER + DO_NODE + DO_CORE)) -eq 0 ]; then
+  if [ $((DO_UPDATE + DO_DNS + DO_DOCKER + DO_NODE + DO_CORE + DO_CERTS + DO_WARP)) -eq 0 ]; then
     [ "$ran" -eq 1 ] && exit 0
     menu
     exit 0
@@ -520,9 +892,12 @@ main() {
 
   banner
   [ "$DO_UPDATE" -eq 1 ] && step_update_server
+  [ "$DO_DNS"    -eq 1 ] && step_setup_dns "$DNS_SERVERS"
   [ "$DO_DOCKER" -eq 1 ] && step_install_docker
   [ "$DO_NODE"   -eq 1 ] && step_install_marznode
   [ "$DO_CORE"   -eq 1 ] && step_change_core
+  [ "$DO_CERTS"  -eq 1 ] && step_get_certs
+  [ "$DO_WARP"   -eq 1 ] && step_install_warp
   echo
   ok "all done — status: install.sh --status"
 }
