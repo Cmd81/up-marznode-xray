@@ -31,6 +31,8 @@ DEFAULT_PORT="53042"
 DEFAULT_DNS="1.1.1.1 8.8.8.8"
 WARP_MTU="1420"
 WGCF_DIR="/etc/wireguard/wgcf"
+WGCF_FALLBACK="2.2.32"
+XRAY_FALLBACK="25.8.3"
 
 # runtime flags
 ASSUME_YES=0
@@ -307,10 +309,11 @@ latest_xray_version() {
   fi
   # fallback: follow the /releases/latest redirect (works when the API is rate limited)
   url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-        "https://github.com/${XRAY_REPO}/releases/latest" 2>/dev/null)" || return 1
+        "https://github.com/${XRAY_REPO}/releases/latest" 2>/dev/null)" || url=""
   ver="${url##*/tag/}"; ver="${ver#v}"
-  [ -n "$ver" ] && [ "$ver" != "$url" ] || return 1
-  printf '%s' "$ver"
+  if [ -n "$ver" ] && [ "$ver" != "$url" ]; then printf '%s' "$ver"; return 0; fi
+  warn "could not query GitHub for the latest Xray release — using pinned fallback v${XRAY_FALLBACK}"
+  printf '%s' "$XRAY_FALLBACK"
 }
 
 step_change_core() {
@@ -579,10 +582,13 @@ latest_wgcf_version() {
     [ -n "$ver" ] && { printf '%s' "$ver"; return 0; }
   fi
   url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-        "https://github.com/${WGCF_REPO}/releases/latest" 2>/dev/null)" || return 1
+        "https://github.com/${WGCF_REPO}/releases/latest" 2>/dev/null)" || url=""
   ver="${url##*/tag/}"; ver="${ver#v}"
-  [ -n "$ver" ] && [ "$ver" != "$url" ] || return 1
-  printf '%s' "$ver"
+  if [ -n "$ver" ] && [ "$ver" != "$url" ]; then printf '%s' "$ver"; return 0; fi
+  # last resort: a known-good pinned version, so a rate-limited GitHub API
+  # (common on fresh VPS IPs) never hard-fails the whole install
+  warn "could not query GitHub for the latest wgcf release — using pinned fallback v${WGCF_FALLBACK}"
+  printf '%s' "$WGCF_FALLBACK"
 }
 
 step_install_warp() {
@@ -718,12 +724,12 @@ run_wizard() {
 
   # -------- 2/7 update & upgrade --------
   echo "${C_BLD}[1/7] Updating the server${C_OFF}"
-  step_update_server || rc=1
+  ( step_update_server ) || { rc=1; warn "server update step failed — continuing"; }
 
   # -------- 3/7 install marznode --------
   echo; echo "${C_BLD}[2/7] Installing marznode${C_OFF}"
-  step_install_docker || rc=1
-  step_install_marznode || rc=1
+  ( step_install_docker ) || { rc=1; warn "docker step failed — continuing"; }
+  ( step_install_marznode ) || { rc=1; warn "marznode install step failed — continuing"; }
 
   # -------- 4/7 config (port + cert already applied inside step 3) ---------
   echo; echo "${C_BLD}[3/7] Node configuration (port, certificate)${C_OFF}"
@@ -731,12 +737,12 @@ run_wizard() {
 
   # -------- 5/7 xray core --------
   echo; echo "${C_BLD}[4/7] Updating the Xray core to v${wiz_core}${C_OFF}"
-  step_change_core || rc=1
+  ( step_change_core ) || { rc=1; warn "xray core step failed — continuing"; }
 
   # -------- 6/7 warp --------
   if [ "$wiz_warp" -eq 1 ]; then
     echo; echo "${C_BLD}[5/7] Installing Cloudflare WARP${C_OFF}"
-    step_install_warp || rc=1
+    ( step_install_warp ) || { rc=1; warn "WARP step failed — continuing"; }
   else
     echo; echo "${C_BLD}[5/7] Cloudflare WARP — skipped${C_OFF}"
   fi
@@ -744,7 +750,7 @@ run_wizard() {
   # -------- 7/7 certificates --------
   if [ "$wiz_ncerts" -gt 0 ]; then
     echo; echo "${C_BLD}[6/7] Issuing TLS certificates${C_OFF}"
-    step_get_certs || rc=1
+    ( step_get_certs ) || { rc=1; warn "certificate step failed — continuing"; }
   else
     echo; echo "${C_BLD}[6/7] TLS certificates — skipped${C_OFF}"
   fi
@@ -1057,13 +1063,13 @@ main() {
   fi
 
   banner
-  [ "$DO_UPDATE" -eq 1 ] && step_update_server
-  [ "$DO_DNS"    -eq 1 ] && step_setup_dns "$DNS_SERVERS"
-  [ "$DO_DOCKER" -eq 1 ] && step_install_docker
-  [ "$DO_NODE"   -eq 1 ] && step_install_marznode
-  [ "$DO_CORE"   -eq 1 ] && step_change_core
-  [ "$DO_CERTS"  -eq 1 ] && step_get_certs
-  [ "$DO_WARP"   -eq 1 ] && step_install_warp
+  [ "$DO_UPDATE" -eq 1 ] && { ( step_update_server ) || warn "server update step failed — continuing"; }
+  [ "$DO_DNS"    -eq 1 ] && { ( step_setup_dns "$DNS_SERVERS" ) || warn "dns step failed — continuing"; }
+  [ "$DO_DOCKER" -eq 1 ] && { ( step_install_docker ) || warn "docker step failed — continuing"; }
+  [ "$DO_NODE"   -eq 1 ] && { ( step_install_marznode ) || warn "marznode install step failed — continuing"; }
+  [ "$DO_CORE"   -eq 1 ] && { ( step_change_core ) || warn "xray core step failed — continuing"; }
+  [ "$DO_CERTS"  -eq 1 ] && { ( step_get_certs ) || warn "certificate step failed — continuing"; }
+  [ "$DO_WARP"   -eq 1 ] && { ( step_install_warp ) || warn "WARP step failed — continuing"; }
   echo
   ok "all done — status: install.sh --status"
 }
