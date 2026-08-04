@@ -594,8 +594,39 @@ latest_wgcf_version() {
 step_install_warp() {
   need_apt; apt_env
   info "step — Cloudflare WARP (wgcf + wireguard)"
-  apt-get install -y -qq wireguard wireguard-tools resolvconf >/dev/null \
+
+  # Safety net: some environments have resolvconf break /etc/resolv.conf on
+  # install (known Debian/Ubuntu conflict with systemd-resolved). Snapshot it
+  # first so we can restore if name resolution stops working afterward.
+  local resolv_bak=""
+  if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+    resolv_bak="$(mktemp)"
+    cp -f /etc/resolv.conf "$resolv_bak"
+  fi
+
+  local wg_pkgs="wireguard wireguard-tools"
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    info "systemd-resolved is active — skipping the classic 'resolvconf' package (it conflicts with it); wg-quick will manage DNS via systemd-resolved directly"
+  else
+    wg_pkgs="$wg_pkgs resolvconf"
+  fi
+  # shellcheck disable=SC2086
+  apt-get install -y -qq $wg_pkgs >/dev/null \
     || die "could not install wireguard packages"
+
+  if ! getent hosts github.com >/dev/null 2>&1; then
+    warn "name resolution broke after installing wireguard packages — restoring resolv.conf"
+    if [ -n "$resolv_bak" ]; then
+      cp -f "$resolv_bak" /etc/resolv.conf
+    else
+      printf 'nameserver %s\n' $DEFAULT_DNS | tr ' ' '\n' | sed '/^$/d' >/etc/resolv.conf 2>/dev/null || true
+      printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >/etc/resolv.conf
+    fi
+    getent hosts github.com >/dev/null 2>&1 \
+      && ok "name resolution restored" \
+      || warn "name resolution still broken — check /etc/resolv.conf manually"
+  fi
+  [ -n "$resolv_bak" ] && rm -f "$resolv_bak"
 
   if ! command -v wgcf >/dev/null 2>&1; then
     local ver arch
