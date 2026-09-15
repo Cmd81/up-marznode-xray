@@ -13,7 +13,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 REPO_RAW="https://raw.githubusercontent.com/Cmd81/up-marznode-xray/main"
 
 MARZNODE_DIR="/var/lib/marznode"
@@ -33,6 +33,18 @@ WARP_MTU="1420"
 WGCF_DIR="/etc/wireguard/wgcf"
 WGCF_FALLBACK="2.2.32"
 XRAY_FALLBACK="25.8.3"
+WARP_CONF="/etc/wireguard/warp.conf"
+WARP_ACCOUNT_JSON="${WGCF_DIR}/warp-account.json"
+# Direct registration against the WARP API, used when wgcf is refused.
+# wgcf still identifies itself as a 2020 Android client (CF-Client-Version
+# a-6.3-1922, endpoint v0a1922); Cloudflare answers "429 Too Many Requests"
+# to that fingerprint from most datacenter IPs. A newer client version on the
+# same API from the same IP is accepted.
+WARP_API="https://api.cloudflareclient.com/v0a2158"
+WARP_CLIENT_VERSION="a-6.10-2158"
+WARP_REGISTER_RETRIES=3
+LOG_FILE="/var/log/marznode-setup.log"
+LAST_ERR_FILE="${TMPDIR:-/tmp}/marznode-setup.lasterr"
 
 # runtime flags
 ASSUME_YES=0
@@ -63,13 +75,54 @@ else
   C_RED=""; C_GRN=""; C_YEL=""; C_CYN=""; C_BLD=""; C_OFF=""
 fi
 
-info() { printf '%s==>%s %s\n' "$C_CYN" "$C_OFF" "$*"; }
-ok()   { printf '%s[ok]%s %s\n' "$C_GRN" "$C_OFF" "$*"; }
-warn() { printf '%s[!]%s  %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
-err()  { printf '%s[x]%s  %s\n' "$C_RED" "$C_OFF" "$*" >&2; }
+# every message is also appended (without colours) to $LOG_FILE, and the last
+# error is kept in $LAST_ERR_FILE so a step running in a subshell can report
+# *why* it failed in the final summary
+_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+info() { printf '%s==>%s %s\n' "$C_CYN" "$C_OFF" "$*"; _log "==> $*"; }
+ok()   { printf '%s[ok]%s %s\n' "$C_GRN" "$C_OFF" "$*"; _log "[ok] $*"; }
+warn() { printf '%s[!]%s  %s\n' "$C_YEL" "$C_OFF" "$*" >&2; _log "[!]  $*"; }
+err()  { printf '%s[x]%s  %s\n' "$C_RED" "$C_OFF" "$*" >&2; _log "[x]  $*"
+         printf '%s\n' "$*" >"$LAST_ERR_FILE" 2>/dev/null || true; }
 die()  { err "$*"; exit 1; }
 
-trap 'err "failed at line $LINENO (exit $?)"' ERR
+# run_step LABEL FUNC [ARGS] — run a step in a subshell, remember failures
+# (label + last error message) for the final report and keep going.
+# It always returns 0 and leaves the step's status in STEP_RC: bash disables
+# `set -e` for everything executed inside an `if`/`||`/`&&` context — the
+# function body and its subshells included — so `( step ) || ...` (the old
+# pattern) silently let unguarded failures slip through. Calling run_step as
+# a plain statement keeps errexit alive inside the step.
+FAILED_STEPS=()
+STEP_RC=0
+run_step() {
+  local label="$1"; shift
+  : >"$LAST_ERR_FILE" 2>/dev/null || true
+  # the parent's ERR trap is silenced for this one command so it does not
+  # overwrite the step's own error message; the subshell re-arms it
+  set +e; trap - ERR
+  ( trap "$ERR_TRAP" ERR; set -e; "$@" )
+  STEP_RC=$?
+  trap "$ERR_TRAP" ERR; set -e
+  if [ "$STEP_RC" -eq 0 ]; then return 0; fi
+  local reason
+  reason="$(head -c 300 "$LAST_ERR_FILE" 2>/dev/null | tr '\n' ' ')"
+  FAILED_STEPS+=("${label}: ${reason:-unknown error}")
+  warn "${label} step failed — continuing (${reason:-see above})"
+  return 0
+}
+
+print_failed_steps() {
+  [ "${#FAILED_STEPS[@]}" -gt 0 ] || return 0
+  echo
+  echo "  ${C_RED}${C_BLD}failed steps:${C_OFF}"
+  local f
+  for f in "${FAILED_STEPS[@]}"; do echo "    - $f"; done
+  echo "  full log: $LOG_FILE"
+}
+
+ERR_TRAP='err "failed at line $LINENO (exit $?)"'
+trap "$ERR_TRAP" ERR
 
 # ------------------------------------------------------------------ tty / io
 # When the script is run as `curl ... | bash`, stdin is the script itself and
@@ -619,7 +672,6 @@ step_install_warp() {
     if [ -n "$resolv_bak" ]; then
       cp -f "$resolv_bak" /etc/resolv.conf
     else
-      printf 'nameserver %s\n' $DEFAULT_DNS | tr ' ' '\n' | sed '/^$/d' >/etc/resolv.conf 2>/dev/null || true
       printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >/etc/resolv.conf
     fi
     getent hosts github.com >/dev/null 2>&1 \
@@ -642,48 +694,216 @@ step_install_warp() {
   ok "wgcf: $(command -v wgcf)"
 
   install -d -m 700 "$WGCF_DIR"
-  cd "$WGCF_DIR"
-  if [ ! -f "$WGCF_DIR/wgcf-account.toml" ]; then
-    info "registering a new WARP account"
-    wgcf register --accept-tos || die "wgcf register failed"
-  else
-    info "existing WARP account found — updating"
-    wgcf update || warn "wgcf update failed; continuing with the current account"
+
+  # 1) an account registered through the API on a previous run -> reuse it
+  # 2) wgcf (register with retries, or update an existing wgcf account)
+  # 3) direct API registration (wgcf refused with 429)
+  local method=""
+  if [ -f "$WARP_ACCOUNT_JSON" ]; then
+    info "existing WARP account found ($WARP_ACCOUNT_JSON) — regenerating $WARP_CONF from it"
+    warp_conf_from_json "$WARP_ACCOUNT_JSON" && method="api-cached"
   fi
-  wgcf generate || die "wgcf generate failed"
-  [ -f "$WGCF_DIR/wgcf-profile.conf" ] || die "wgcf-profile.conf was not produced"
-
-  # MTU 1420 avoids fragmentation; Table=off keeps WARP from hijacking the
-  # server's default route (otherwise the node loses its own connectivity).
-  local prof="$WGCF_DIR/wgcf-profile.conf"
-  grep -qE '^[[:space:]]*MTU[[:space:]]*=' "$prof" \
-    && sed -i -E "s|^[[:space:]]*MTU[[:space:]]*=.*|MTU = ${WARP_MTU}|" "$prof" \
-    || sed -i "0,/^\[Interface\]/s||&\nMTU = ${WARP_MTU}|" "$prof"
-  grep -qE '^[[:space:]]*Table[[:space:]]*=' "$prof" \
-    && sed -i -E "s|^[[:space:]]*Table[[:space:]]*=.*|Table = off|" "$prof" \
-    || sed -i "0,/^\[Interface\]/s||&\nTable = off|" "$prof"
-
-  install -m 600 "$prof" /etc/wireguard/warp.conf
-  ok "/etc/wireguard/warp.conf written (MTU ${WARP_MTU}, Table off)"
+  if [ -z "$method" ]; then
+    warp_wgcf_flow && method="wgcf"
+  fi
+  if [ -z "$method" ]; then
+    warn "wgcf could not produce a profile — falling back to direct registration (${WARP_API})"
+    warp_register_api && method="api"
+  fi
+  [ -n "$method" ] || die "WARP registration failed by every method — see $LOG_FILE"
+  ok "$WARP_CONF written via ${method} (MTU ${WARP_MTU}, Table off)"
 
   systemctl enable --now wg-quick@warp >/dev/null 2>&1 \
     || die "wg-quick@warp failed to start — check: journalctl -u wg-quick@warp"
   sleep 2
-  warp_status
+  warp_status || true
+  check_xray_interfaces || true
   warn "Table=off means WARP is NOT the default route. Traffic only uses it when"
   warn "an xray outbound is bound to the warp interface / its address."
 }
 
-warp_status() {
-  if systemctl is-active --quiet wg-quick@warp 2>/dev/null; then
-    ok "wg-quick@warp is active"
-    wg show warp 2>/dev/null | head -n 8 || true
-    local trace
-    trace="$(curl -fsSL --max-time 8 --interface warp https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^warp=' || true)"
-    [ -n "$trace" ] && info "cloudflare trace via warp: $trace"
+# --- wgcf path -----------------------------------------------------------
+wgcf_register_retry() {
+  local i out
+  for ((i = 1; i <= WARP_REGISTER_RETRIES; i++)); do
+    info "wgcf register (attempt $i/$WARP_REGISTER_RETRIES)"
+    if out="$(wgcf register --accept-tos 2>&1)"; then return 0; fi
+    _log "wgcf register: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"
+    if printf '%s' "$out" | grep -q '429'; then
+      warn "Cloudflare answered 429 Too Many Requests to wgcf"
+    else
+      warn "wgcf register failed: $(printf '%s' "$out" | grep -m1 -iE 'wraps|error' | head -c 120)"
+    fi
+    if [ "$i" -lt "$WARP_REGISTER_RETRIES" ]; then sleep 10; fi
+  done
+  return 1
+}
+
+# Register/update with wgcf and turn its profile into $WARP_CONF.
+# Runs in a subshell so the cd does not leak. Returns 1 on any failure.
+warp_wgcf_flow() {
+  (
+    cd "$WGCF_DIR" || exit 1
+    if [ ! -f wgcf-account.toml ]; then
+      wgcf_register_retry || exit 1
+    else
+      info "existing wgcf account found — updating"
+      wgcf update >/dev/null 2>&1 || warn "wgcf update failed; continuing with the current account"
+    fi
+    local out
+    if ! out="$(wgcf generate 2>&1)"; then
+      warn "wgcf generate failed: $(printf '%s' "$out" | grep -m1 -iE 'wraps|error' | head -c 120)"
+      exit 1
+    fi
+    [ -f wgcf-profile.conf ] || { warn "wgcf-profile.conf was not produced"; exit 1; }
+    warp_finalize_profile wgcf-profile.conf
+  )
+}
+
+# MTU 1420 avoids fragmentation; Table=off keeps WARP from hijacking the
+# server's default route (otherwise the node loses its own connectivity);
+# the DNS line is dropped so a Table=off interface never touches the
+# system resolvers.
+warp_finalize_profile() {
+  local prof="$1"
+  if grep -qE '^[[:space:]]*MTU[[:space:]]*=' "$prof"; then
+    sed -i -E "s|^[[:space:]]*MTU[[:space:]]*=.*|MTU = ${WARP_MTU}|" "$prof"
   else
-    info "wg-quick@warp is not running"
+    sed -i "0,/^\[Interface\]/s||&\nMTU = ${WARP_MTU}|" "$prof"
   fi
+  if grep -qE '^[[:space:]]*Table[[:space:]]*=' "$prof"; then
+    sed -i -E "s|^[[:space:]]*Table[[:space:]]*=.*|Table = off|" "$prof"
+  else
+    sed -i "0,/^\[Interface\]/s||&\nTable = off|" "$prof"
+  fi
+  sed -i -E '/^[[:space:]]*DNS[[:space:]]*=/d' "$prof"
+  install -m 600 "$prof" "$WARP_CONF"
+}
+
+# --- direct API path -----------------------------------------------------
+ensure_jq() {
+  command -v jq >/dev/null 2>&1 && return 0
+  apt_env; apt-get install -y -qq jq >/dev/null || die "jq is required for the WARP API fallback"
+}
+
+warp_register_api() {
+  ensure_jq
+  command -v wg >/dev/null 2>&1 || { warn "wireguard-tools (wg) missing"; return 1; }
+  local priv pub tos body resp http
+  priv="$(wg genkey)"; pub="$(printf '%s' "$priv" | wg pubkey)"
+  tos="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  body="$(jq -cn --arg k "$pub" --arg t "$tos" \
+    '{key:$k, install_id:"", fcm_token:"", tos:$t, model:"PC", serial_number:"", locale:"en_US", type:"Android"}')"
+  if ! resp="$(curl -sS --max-time 20 -w '\n%{http_code}' -X POST "${WARP_API}/reg" \
+        -H 'Content-Type: application/json' -H 'User-Agent: okhttp/3.12.1' \
+        -H "CF-Client-Version: ${WARP_CLIENT_VERSION}" -d "$body" 2>&1)"; then
+    warn "WARP API unreachable: $(printf '%s' "$resp" | head -c 120)"
+    return 1
+  fi
+  http="${resp##*$'\n'}"; resp="${resp%$'\n'*}"
+  if [ "$http" != "200" ]; then
+    warn "WARP API registration failed (HTTP ${http}): $(printf '%s' "$resp" | head -c 160)"
+    return 1
+  fi
+  # a successful registration is the bare device object; errors come wrapped
+  # as {"success":false,"errors":[...]} — accept both shapes
+  local reg
+  reg="$(printf '%s' "$resp" | jq -c 'if (type == "object" and has("result") and .result != null) then .result else . end' 2>/dev/null || true)"
+  if ! printf '%s' "$reg" | jq -e '.config.peers[0].public_key != null and .config.interface.addresses.v4 != null' >/dev/null 2>&1; then
+    warn "WARP API returned an unexpected payload: $(printf '%s' "$resp" | head -c 160)"
+    return 1
+  fi
+  printf '%s' "$reg" | jq --arg pk "$priv" '. + {private_key: $pk}' >"$WARP_ACCOUNT_JSON"
+  chmod 600 "$WARP_ACCOUNT_JSON"
+  ok "WARP account registered via API (id $(jq -r '.id' "$WARP_ACCOUNT_JSON" | head -c 8)…) — saved to $WARP_ACCOUNT_JSON"
+  warp_conf_from_json "$WARP_ACCOUNT_JSON"
+}
+
+warp_conf_from_json() {
+  ensure_jq
+  local j="$1" priv v4 v6 peer ep x tmp
+  priv="$(jq -r '.private_key // empty' "$j")"
+  v4="$(jq -r '.config.interface.addresses.v4 // empty' "$j")"
+  v6="$(jq -r '.config.interface.addresses.v6 // empty' "$j")"
+  peer="$(jq -r '.config.peers[0].public_key // empty' "$j")"
+  ep="$(jq -r '.config.peers[0].endpoint.host // "engage.cloudflareclient.com:2408"' "$j")"
+  for x in "$priv" "$v4" "$v6" "$peer"; do
+    [ -n "$x" ] || { warn "incomplete WARP account data in $j"; return 1; }
+  done
+  tmp="$(mktemp)"
+  cat >"$tmp" <<CONF
+[Interface]
+PrivateKey = ${priv}
+Address = ${v4}/32
+Address = ${v6}/128
+MTU = ${WARP_MTU}
+Table = off
+
+[Peer]
+PublicKey = ${peer}
+AllowedIPs = 0.0.0.0/0
+AllowedIPs = ::/0
+Endpoint = ${ep}
+CONF
+  install -m 600 "$tmp" "$WARP_CONF"
+  rm -f "$tmp"
+}
+
+# --- status / checks -----------------------------------------------------
+# returns 0 only when the interface is up AND Cloudflare confirms the tunnel
+warp_status() {
+  if ! systemctl is-active --quiet wg-quick@warp 2>/dev/null; then
+    info "wg-quick@warp is not running"
+    return 1
+  fi
+  ok "wg-quick@warp is active"
+  wg show warp 2>/dev/null | head -n 8 || true
+  local trace
+  trace="$(curl -fsSL --max-time 10 --interface warp https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+           | grep -E '^(warp|ip)=' | tr '\n' ' ' || true)"
+  case "$trace" in
+    *warp=on*|*warp=plus*)
+      ok "tunnel verified via cloudflare trace: $trace"
+      return 0 ;;
+    *)
+      warn "interface is up but the tunnel is NOT confirmed (trace: ${trace:-no answer})"
+      warn "UDP 2408 may be blocked here — try Endpoint port 500, 1701 or 4500 in $WARP_CONF, then: systemctl restart wg-quick@warp"
+      return 1 ;;
+  esac
+}
+
+# interfaces named by outbounds' streamSettings.sockopt.interface
+xray_bound_interfaces() {
+  [ -s "$XRAY_CONFIG" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.outbounds[]? | .streamSettings?.sockopt?.interface? // empty' "$XRAY_CONFIG" 2>/dev/null | sort -u || true
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$XRAY_CONFIG" <<'PY' 2>/dev/null
+import json, sys
+seen = set()
+for o in json.load(open(sys.argv[1])).get("outbounds", []):
+    i = ((o.get("streamSettings") or {}).get("sockopt") or {}).get("interface")
+    if i and i not in seen:
+        seen.add(i); print(i)
+PY
+  fi
+}
+
+# Xray does NOT fail when sockopt.interface names a missing interface — it
+# silently dials through the default route instead, so a dead WARP looks
+# like it works. Catch that here.
+check_xray_interfaces() {
+  local i rc=0
+  while IFS= read -r i; do
+    [ -n "$i" ] || continue
+    if ip link show "$i" >/dev/null 2>&1; then
+      ok "xray outbound bound to interface '$i' — interface present"
+    else
+      err "xray outbound bound to interface '$i' — interface MISSING: Xray silently sends that traffic through the default route"
+      rc=1
+    fi
+  done < <(xray_bound_interfaces)
+  return $rc
 }
 
 warp_disable() {
@@ -692,9 +912,10 @@ warp_disable() {
 }
 
 warp_enable() {
-  [ -f /etc/wireguard/warp.conf ] || die "warp.conf not found — run the WARP install first"
+  [ -f "$WARP_CONF" ] || die "warp.conf not found — run the WARP install first"
   systemctl enable --now wg-quick@warp
-  warp_status
+  warp_status || true
+  check_xray_interfaces || true
 }
 
 # ================================================================ WIZARD MODE
@@ -755,12 +976,12 @@ run_wizard() {
 
   # -------- 2/7 update & upgrade --------
   echo "${C_BLD}[1/7] Updating the server${C_OFF}"
-  ( step_update_server ) || { rc=1; warn "server update step failed — continuing"; }
+  run_step "server update" step_update_server; [ "$STEP_RC" -eq 0 ] || rc=1
 
   # -------- 3/7 install marznode --------
   echo; echo "${C_BLD}[2/7] Installing marznode${C_OFF}"
-  ( step_install_docker ) || { rc=1; warn "docker step failed — continuing"; }
-  ( step_install_marznode ) || { rc=1; warn "marznode install step failed — continuing"; }
+  run_step "docker" step_install_docker; [ "$STEP_RC" -eq 0 ] || rc=1
+  run_step "marznode install" step_install_marznode; [ "$STEP_RC" -eq 0 ] || rc=1
 
   # -------- 4/7 config (port + cert already applied inside step 3) ---------
   echo; echo "${C_BLD}[3/7] Node configuration (port, certificate)${C_OFF}"
@@ -768,12 +989,12 @@ run_wizard() {
 
   # -------- 5/7 xray core --------
   echo; echo "${C_BLD}[4/7] Updating the Xray core to v${wiz_core}${C_OFF}"
-  ( step_change_core ) || { rc=1; warn "xray core step failed — continuing"; }
+  run_step "xray core" step_change_core; [ "$STEP_RC" -eq 0 ] || rc=1
 
   # -------- 6/7 warp --------
   if [ "$wiz_warp" -eq 1 ]; then
     echo; echo "${C_BLD}[5/7] Installing Cloudflare WARP${C_OFF}"
-    ( step_install_warp ) || { rc=1; warn "WARP step failed — continuing"; }
+    run_step "WARP" step_install_warp; [ "$STEP_RC" -eq 0 ] || rc=1
   else
     echo; echo "${C_BLD}[5/7] Cloudflare WARP — skipped${C_OFF}"
   fi
@@ -781,7 +1002,7 @@ run_wizard() {
   # -------- 7/7 certificates --------
   if [ "$wiz_ncerts" -gt 0 ]; then
     echo; echo "${C_BLD}[6/7] Issuing TLS certificates${C_OFF}"
-    ( step_get_certs ) || { rc=1; warn "certificate step failed — continuing"; }
+    run_step "certificates" step_get_certs; [ "$STEP_RC" -eq 0 ] || rc=1
   else
     echo; echo "${C_BLD}[6/7] TLS certificates — skipped${C_OFF}"
   fi
@@ -827,11 +1048,23 @@ wizard_report() {
   if [ "$warp" -eq 1 ]; then
     if systemctl is-active --quiet wg-quick@warp 2>/dev/null; then
       echo "${C_GRN}active${C_OFF} (Table=off — not the default route)"
+    elif [ -f "$WARP_CONF" ]; then
+      echo "${C_RED}configured but not running${C_OFF} — check: journalctl -u wg-quick@warp"
     else
-      echo "${C_RED}requested but not active${C_OFF} — check: journalctl -u wg-quick@warp"
+      echo "${C_RED}registration failed${C_OFF} — see 'failed steps' below and $LOG_FILE"
     fi
   else
     echo "skipped"
+  fi
+
+  printf '  %-20s ' "Xray iface binding"
+  local ifs; ifs="$(xray_bound_interfaces 2>/dev/null | tr '\n' ' ' || true)"
+  if [ -z "$ifs" ]; then
+    echo "no outbound is bound to an interface"
+  elif check_xray_interfaces >/dev/null 2>&1; then
+    echo "${C_GRN}ok${C_OFF} (${ifs% })"
+  else
+    echo "${C_RED}MISSING interface${C_OFF} — outbounds reference: ${ifs% }(that traffic goes direct!)"
   fi
 
   printf '  %-20s ' "TLS certificates"
@@ -852,11 +1085,13 @@ wizard_report() {
     echo "skipped"
   fi
 
+  print_failed_steps
   echo "──────────────────────────────────────────────────────────"
   echo "  useful commands:"
   echo "    marznode-setup --status"
   echo "    cd $dir && docker compose logs -f"
   [ "$warp" -eq 1 ] && echo "    marznode-setup --warp-status"
+  echo "    log: $LOG_FILE"
   echo "══════════════════════════════════════════════════════════"
   echo
 }
@@ -900,6 +1135,7 @@ show_status() {
   else
     info "warp: inactive"
   fi
+  check_xray_interfaces || true
   echo
 }
 
@@ -983,7 +1219,7 @@ MENU
        case "$w" in
          enable)  warp_enable ;;
          disable) warp_disable ;;
-         *)       warp_status ;;
+         *)       warp_status || true ;;
        esac ;;
    10) set_service_port "$(ask "port" "$DEFAULT_PORT")"; restart_node ;;
    11) show_status ;;
@@ -1035,6 +1271,8 @@ Usage: install.sh [options]
   -y, --yes             assume yes for all prompts
   -h, --help            this help
 
+ Every run is logged to ${LOG_FILE}.
+
 Examples:
   install.sh --all --cert-file /root/client.pem --port 53042 -y
   install.sh --certs node1.example.com,node2.example.com --email you@mail.com -y
@@ -1065,7 +1303,7 @@ main() {
       --warp)         DO_WARP=1 ;;
       --warp-on)      warp_enable; ran=1 ;;
       --warp-off)     warp_disable; ran=1 ;;
-      --warp-status)  warp_status; ran=1 ;;
+      --warp-status)  warp_status || true; ran=1 ;;
       --port)         WANT_PORT="${2:?--port needs a value}"; shift ;;
       --dir)          APP_DIR="${2:?--dir needs a value}"; shift ;;
       --cert-file)    CERT_SRC_FILE="${2:?--cert-file needs a path}"; shift ;;
@@ -1083,8 +1321,8 @@ main() {
   done
 
   if [ "$WIZARD" -eq 1 ]; then
-    run_wizard
-    exit $?
+    run_wizard || exit $?
+    exit 0
   fi
 
   if [ $((DO_UPDATE + DO_DNS + DO_DOCKER + DO_NODE + DO_CORE + DO_CERTS + DO_WARP)) -eq 0 ]; then
@@ -1094,15 +1332,22 @@ main() {
   fi
 
   banner
-  [ "$DO_UPDATE" -eq 1 ] && { ( step_update_server ) || warn "server update step failed — continuing"; }
-  [ "$DO_DNS"    -eq 1 ] && { ( step_setup_dns "$DNS_SERVERS" ) || warn "dns step failed — continuing"; }
-  [ "$DO_DOCKER" -eq 1 ] && { ( step_install_docker ) || warn "docker step failed — continuing"; }
-  [ "$DO_NODE"   -eq 1 ] && { ( step_install_marznode ) || warn "marznode install step failed — continuing"; }
-  [ "$DO_CORE"   -eq 1 ] && { ( step_change_core ) || warn "xray core step failed — continuing"; }
-  [ "$DO_CERTS"  -eq 1 ] && { ( step_get_certs ) || warn "certificate step failed — continuing"; }
-  [ "$DO_WARP"   -eq 1 ] && { ( step_install_warp ) || warn "WARP step failed — continuing"; }
+  local rc=0
+  if [ "$DO_UPDATE" -eq 1 ]; then run_step "server update" step_update_server;    [ "$STEP_RC" -eq 0 ] || rc=1; fi
+  if [ "$DO_DNS"    -eq 1 ]; then run_step "dns" step_setup_dns "$DNS_SERVERS";     [ "$STEP_RC" -eq 0 ] || rc=1; fi
+  if [ "$DO_DOCKER" -eq 1 ]; then run_step "docker" step_install_docker;            [ "$STEP_RC" -eq 0 ] || rc=1; fi
+  if [ "$DO_NODE"   -eq 1 ]; then run_step "marznode install" step_install_marznode; [ "$STEP_RC" -eq 0 ] || rc=1; fi
+  if [ "$DO_CORE"   -eq 1 ]; then run_step "xray core" step_change_core;            [ "$STEP_RC" -eq 0 ] || rc=1; fi
+  if [ "$DO_CERTS"  -eq 1 ]; then run_step "certificates" step_get_certs;           [ "$STEP_RC" -eq 0 ] || rc=1; fi
+  if [ "$DO_WARP"   -eq 1 ]; then run_step "WARP" step_install_warp;                [ "$STEP_RC" -eq 0 ] || rc=1; fi
   echo
-  ok "all done — status: install.sh --status"
+  if [ "$rc" -eq 0 ]; then
+    ok "all done — status: install.sh --status"
+  else
+    print_failed_steps
+    err "finished with errors — status: install.sh --status"
+  fi
+  exit "$rc"
 }
 
 main "$@"
